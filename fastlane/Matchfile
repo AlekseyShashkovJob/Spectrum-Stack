@@ -1,0 +1,8 @@
+git_url(ENV["MATCH_GIT_URL"] || "https://github.com/NikDyr/BrainrotCheckerCerts.git")
+storage_mode("git")
+
+if ENV["BUILD_TYPE"] == "short"
+	app_identifier([ENV["BUNDLE_IDENTIFIER"]])
+else
+	app_identifier([ENV["BUNDLE_IDENTIFIER"], ENV["BUNDLE_IDENTIFIER"] + ".notifications"])
+end
