@@ -97,7 +97,7 @@ jobs:
           echo "::group::Required repository files"
           check_file "GoogleService-Info.plist"
           check_file "fastlane/Fastfile"
-          check_filee "Gemfile"
+          check_file "Gemfile"
           check_file "EasyLaunch-Patch/patch.sh"
           check_file "ProjectSettings/ProjectSettings.asset"
           echo "::endgroup::"
