@@ -17,6 +17,11 @@ jobs:
     name: Validate secrets and variables
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
       - name: Check required values
         env:
           # Unity
