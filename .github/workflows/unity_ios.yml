@@ -44,7 +44,6 @@ jobs:
           # EasyLaunch patch
           EL_APPSFLYER_DEV_KEY:     ${{ secrets.EL_APPSFLYER_DEV_KEY }}
           EL_ENDPOINT_URL:          ${{ vars.EL_ENDPOINT_URL }}
-          EL_FIREBASE_GCM_SENDER_ID: ${{ vars.EL_FIREBASE_GCM_SENDER_ID }}
         run: |
           MISSING=()
 
@@ -96,7 +95,6 @@ jobs:
           echo "::group::EasyLaunch patch"
           check "EL_APPSFLYER_DEV_KEY"      "$EL_APPSFLYER_DEV_KEY"
           check "EL_ENDPOINT_URL"           "$EL_ENDPOINT_URL"
-          check "EL_FIREBASE_GCM_SENDER_ID" "$EL_FIREBASE_GCM_SENDER_ID"
           echo "::endgroup::"
 
           echo "::group::Required repository files"
@@ -156,6 +154,12 @@ jobs:
           sed -i "s/  targetDevice: .*/  targetDevice: 0/" ProjectSettings/ProjectSettings.asset
           echo "Set to: iPhone only (0)"
           grep "targetDevice:" ProjectSettings/ProjectSettings.asset
+          echo "::endgroup::"
+
+          echo "::group::Disable Unity Splash Screen"
+          sed -i "s/  m_ShowUnitySplashScreen: .*/  m_ShowUnitySplashScreen: 0/" ProjectSettings/ProjectSettings.asset
+          echo "Set to: m_ShowUnitySplashScreen = 0"
+          grep "m_ShowUnitySplashScreen:" ProjectSettings/ProjectSettings.asset
           echo "::endgroup::"
 
       - name: Free Disk Space (Ubuntu)
@@ -220,14 +224,12 @@ jobs:
           EL_APPSFLYER_DEV_KEY:      ${{ secrets.EL_APPSFLYER_DEV_KEY }}
           EL_APPLE_APP_ID:           ${{ vars.APPLE_ID_DIGITS || secrets.APPLE_ID_DIGITS }}
           EL_ENDPOINT_URL:           ${{ vars.EL_ENDPOINT_URL }}
-          EL_FIREBASE_GCM_SENDER_ID: ${{ vars.EL_FIREBASE_GCM_SENDER_ID }}
           EL_LOADING_TITLE:          ${{ vars.EL_LOADING_TITLE || 'Loading' }}
         run: |
           echo "::group::Generate easylaunch.config"
           printf 'EL_APPSFLYER_DEV_KEY="%s"\n'      "$EL_APPSFLYER_DEV_KEY"      >  EasyLaunch-Patch/easylaunch.config
           printf 'EL_APPLE_APP_ID="%s"\n'           "$EL_APPLE_APP_ID"           >> EasyLaunch-Patch/easylaunch.config
           printf 'EL_ENDPOINT_URL="%s"\n'           "$EL_ENDPOINT_URL"           >> EasyLaunch-Patch/easylaunch.config
-          printf 'EL_FIREBASE_GCM_SENDER_ID="%s"\n' "$EL_FIREBASE_GCM_SENDER_ID" >> EasyLaunch-Patch/easylaunch.config
           printf 'EL_LOADING_TITLE="%s"\n'          "$EL_LOADING_TITLE"          >> EasyLaunch-Patch/easylaunch.config
           echo "Config written."
           echo "::endgroup::"
@@ -247,12 +249,37 @@ jobs:
           require 'xcodeproj'
           project = Xcodeproj::Project.open('build/iOS/iOS/Unity-iPhone.xcodeproj')
           project.targets.each do |target|
-            target.build_configurations.each do |config|              
+            target.build_configurations.each do |config|
               config.build_settings['VERSIONING_SYSTEM'] = 'apple-generic'
               config.build_settings['CURRENT_PROJECT_VERSION'] = ENV['LAST_UPLOADED_BUILD_NUMBER'] || '0'
               puts "#{target.name} - #{config.build_settings['VERSIONING_SYSTEM']}"
             end
           end
+
+          # patch_pbxproj.py runs twice (pre- and post-SPM-resolve) and uses
+          # deterministic UUIDs, so the same PBXBuildFile UUID can end up
+          # referenced in two different ResourcesBuildPhases (Unity-iPhone and
+          # NotificationService). xcodeproj's parent-consistency check raises on
+          # save in that case. Fix: give every extra occurrence its own object.
+          uuid_phases = Hash.new { |h, k| h[k] = [] }
+          project.targets.each do |target|
+            target.build_phases.each do |phase|
+              phase.files.each { |bf| uuid_phases[bf.uuid] << [phase, bf] }
+            end
+          end
+          uuid_phases.each do |_uuid, entries|
+            next if entries.size < 2
+            entries[1..].each do |phase, old_bf|
+              new_bf = project.new(Xcodeproj::Project::Object::PBXBuildFile)
+              new_bf.file_ref = old_bf.file_ref
+              new_bf.settings = old_bf.settings.dup if old_bf.settings
+              idx = phase.files.index(old_bf)
+              phase.files.delete(old_bf)
+              phase.files.insert(idx, new_bf)
+              puts "  fixed duplicate build-file '#{old_bf.file_ref&.path}' in #{phase.class} of #{phase.target&.name rescue '?'}"
+            end
+          end
+
           project.save
           RUBY
 

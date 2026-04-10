@@ -9,6 +9,8 @@
 @property (nonatomic, strong) UIButton *cancelButton;
 @property (nonatomic, copy) NotificationPromptHandler allowHandler;
 @property (nonatomic, copy) NotificationPromptHandler cancelHandler;
+/// Kept so we can resize it on rotation (it lives inside gradView, not self.view.layer directly).
+@property (nonatomic, strong) CAGradientLayer *gradientLayer;
 @end
 
 @implementation NotificationPromptViewController
@@ -36,17 +38,17 @@
     [self.view addSubview:_bgImageView];
 
     // Gradient overlay to darken image
-    CAGradientLayer *grad = [CAGradientLayer layer];
-    grad.colors = @[(id)[UIColor colorWithWhite:0.0 alpha:0.45].CGColor,
-                    (id)[UIColor colorWithWhite:0.0 alpha:0.65].CGColor];
-    grad.startPoint = CGPointMake(0.5, 0.0);
-    grad.endPoint = CGPointMake(0.5, 1.0);
+    _gradientLayer = [CAGradientLayer layer];
+    _gradientLayer.colors = @[(id)[UIColor colorWithWhite:0.0 alpha:0.45].CGColor,
+                               (id)[UIColor colorWithWhite:0.0 alpha:0.65].CGColor];
+    _gradientLayer.startPoint = CGPointMake(0.5, 0.0);
+    _gradientLayer.endPoint = CGPointMake(0.5, 1.0);
 
     UIView *gradView = [UIView new];
     gradView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:gradView];
-    grad.frame = self.view.bounds;
-    [gradView.layer insertSublayer:grad atIndex:0];
+    // frame will be set to final bounds in viewDidLayoutSubviews
+    [gradView.layer insertSublayer:_gradientLayer atIndex:0];
 
     // Container for labels/buttons
     _contentView = [UIView new];
@@ -112,8 +114,20 @@
         [gradView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
 
         [self.contentView.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [self.contentView.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant: -20],
-        [self.contentView.widthAnchor constraintEqualToAnchor:self.view.widthAnchor multiplier:0.82],
+        // Desired vertical center (safe-area) — lower priority so inequality clamps can win.
+        ({  NSLayoutConstraint *c = [self.contentView.centerYAnchor
+                constraintEqualToAnchor:self.view.safeAreaLayoutGuide.centerYAnchor];
+            c.priority = UILayoutPriorityDefaultHigh; c; }),
+        // Hard clamp: never leave the safe area.
+        [self.contentView.topAnchor
+            constraintGreaterThanOrEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:16],
+        [self.contentView.bottomAnchor
+            constraintLessThanOrEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-16],
+        // Width: desired 82 % of view width, capped at 480 pt (comfortable on wide landscape).
+        ({  NSLayoutConstraint *c = [self.contentView.widthAnchor
+                constraintEqualToAnchor:self.view.widthAnchor multiplier:0.82];
+            c.priority = UILayoutPriorityDefaultHigh; c; }),
+        [self.contentView.widthAnchor constraintLessThanOrEqualToConstant:480],
 
         [self.titleLabel.topAnchor constraintEqualToAnchor:self.contentView.topAnchor],
         [self.titleLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor],
@@ -142,12 +156,8 @@
 - (void)viewDidLayoutSubviews
 {
     [super viewDidLayoutSubviews];
-    // Ensure gradient view frame updated
-    for (CALayer *subl in self.view.layer.sublayers) {
-        if ([subl isKindOfClass:[CAGradientLayer class]]) {
-            subl.frame = self.view.bounds;
-        }
-    }
+    // Keep gradient filling the whole screen on every rotation.
+    _gradientLayer.frame = self.view.bounds;
 }
 
 - (void)onAllow:(id)sender

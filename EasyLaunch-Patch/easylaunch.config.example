@@ -16,10 +16,6 @@ EL_APPLE_APP_ID="000000000"
 # Эндпоинт запроса: EL_ENDPOINT_URL/api/init
 EL_ENDPOINT_URL="https://your-server.com"
 
-# ── Firebase ─────────────────────────────────────────────────────────────────
-# GCM Sender ID = Project Number из Firebase Console → Project Settings → General
-EL_FIREBASE_GCM_SENDER_ID="000000000000"
-
 # ── UI ───────────────────────────────────────────────────────────────────────
 # Заголовок на экране загрузки
 EL_LOADING_TITLE="Loading"

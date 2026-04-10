@@ -74,8 +74,7 @@
 
         PreloadConfig *cfg = [PreloadConfig configWithAppsDevKey:EL_APPSFLYER_DEV_KEY
                                                       appleAppId:EL_APPLE_APP_ID
-                                                     endpointURL:EL_ENDPOINT_URL
-                                             firebaseGCMSenderId:EL_FIREBASE_GCM_SENDER_ID];
+                                                     endpointURL:EL_ENDPOINT_URL];
         vc.config = cfg;
 
         // По завершении всех проверок — скрываем preload и запускаем Unity

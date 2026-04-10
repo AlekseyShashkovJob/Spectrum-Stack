@@ -4,6 +4,57 @@
 #import "NotificationPromptViewController.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Персистентный наблюдатель FCM-токена
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Храним наблюдатель сильной ссылкой — живёт всё время жизни приложения.
+static id        s_fcmTokenObserver  = nil;
+/// URL эндпойнта, известный наблюдателю (не зависит от жизни VC).
+static NSString *s_fcmEndpointURL   = nil;
+
+/// Отправляет на сервер поля Firebase + данные конверсии AF.
+/// Вызывается из блока наблюдателя (без ссылки на VC).
+static void PL_sendFirebaseFields(NSString *endpointURL)
+{
+    NSString *pushToken       = [PLServicesWrapper firebasePushToken];
+    if (pushToken.length == 0) return; // токен ещё недоступен
+
+    NSMutableDictionary *body = [NSMutableDictionary dictionary];
+    body[@"bundle_id"]   = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    body[@"platform"]    = @"ios";
+    body[@"os"]          = @"iOS";
+
+    NSString *afId = [PLServicesWrapper appsFlyerDeviceId];
+    if (afId.length)  body[@"af_id"] = afId;
+
+    NSString *firebaseProject = [PLServicesWrapper firebaseProjectId];
+    if (firebaseProject.length) body[@"firebase_project_id"] = firebaseProject;
+    body[@"push_token"] = pushToken;
+
+    // Данные конверсии AF (сохраняются персистентно)
+    NSDictionary *afData = [PLServicesWrapper storedAppsFlyerConversionData];
+    if (afData.count) [body addEntriesFromDictionary:afData];
+
+    NSError *jsonErr = nil;
+    NSData  *jsonData = [NSJSONSerialization dataWithJSONObject:body options:0 error:&jsonErr];
+    if (!jsonData) { NSLog(@"[PreloadVC] FCM-send JSON error: %@", jsonErr); return; }
+
+    NSURL *url = [NSURL URLWithString:[endpointURL stringByAppendingString:@"/config.php"]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    req.timeoutInterval = 10.0;
+    req.HTTPBody = jsonData;
+
+    // Ответ сервера не важен
+    [[NSURLSession.sharedSession dataTaskWithRequest:req
+                                  completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)r;
+        NSLog(@"[PreloadVC] FCM-send: status=%ld error=%@", (long)http.statusCode, e);
+    }] resume];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - PreloadConfig
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -22,13 +73,11 @@
 + (instancetype)configWithAppsDevKey:(NSString *)devKey
                           appleAppId:(NSString *)appleId
                          endpointURL:(NSString *)endpoint
-                  firebaseGCMSenderId:(NSString *)gcmSenderId
 {
     PreloadConfig *c      = [PreloadConfig new];
     c.appsDevKey          = devKey;
     c.appleAppId          = appleId;
     c.endpointURL         = endpoint;
-    c.firebaseGCMSenderId = gcmSenderId;
     return c;
 }
 
@@ -150,16 +199,31 @@
     [v addSubview:_spinner];
     [_spinner startAnimating];
 
+    // Desired width — 55 % of view width (high priority, can yield).
+    NSLayoutConstraint *logoWidthDesired =
+        [_logoImageView.widthAnchor constraintEqualToAnchor:v.widthAnchor multiplier:0.55];
+    logoWidthDesired.priority = UILayoutPriorityDefaultHigh; // 750
+
+    // Hard caps so the logo never overflows in landscape.
+    NSLayoutConstraint *logoWidthMax =
+        [_logoImageView.widthAnchor constraintLessThanOrEqualToAnchor:v.widthAnchor multiplier:0.55];
+    NSLayoutConstraint *logoHeightMax =
+        [_logoImageView.heightAnchor constraintLessThanOrEqualToAnchor:v.safeAreaLayoutGuide.heightAnchor
+                                                             multiplier:0.40];
+
     [NSLayoutConstraint activateConstraints:@[
-        // Логотип — по центру экрана
+        // Логотип — центрирован относительно безопасной области
         [_logoImageView.centerXAnchor constraintEqualToAnchor:v.centerXAnchor],
-        [_logoImageView.centerYAnchor constraintEqualToAnchor:v.centerYAnchor constant:-60],
-        [_logoImageView.widthAnchor   constraintEqualToAnchor:v.widthAnchor multiplier:0.55],
-        [_logoImageView.heightAnchor  constraintEqualToAnchor:_logoImageView.widthAnchor],
+        [_logoImageView.centerYAnchor constraintEqualToAnchor:v.safeAreaLayoutGuide.centerYAnchor constant:-44],
+        logoWidthDesired,
+        logoWidthMax,
+        logoHeightMax,
+        // 1 : 1 — картинка квадратная
+        [_logoImageView.heightAnchor constraintEqualToAnchor:_logoImageView.widthAnchor],
 
         // Спиннер — ниже логотипа
         [_spinner.centerXAnchor constraintEqualToAnchor:v.centerXAnchor],
-        [_spinner.topAnchor     constraintEqualToAnchor:_logoImageView.bottomAnchor constant:36],
+        [_spinner.topAnchor     constraintEqualToAnchor:_logoImageView.bottomAnchor constant:24],
     ]];
 }
 
@@ -255,7 +319,36 @@
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             [self pl_step3_initAppsFlyer];
         });
+        // Регистрируем наблюдатель после Firebase init — к этому моменту
+        // FIRMessaging.delegate уже выставлен и токен может прийти в любой момент.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self pl_registerPersistentFCMTokenObserver];
+        });
     }];
+}
+
+/// Регистрирует глобальный наблюдатель PLFCMTokenDidUpdateNotification.
+/// Вызывать один раз — наблюдатель хранится статически (s_fcmTokenObserver) и не удаляется.
+- (void)pl_registerPersistentFCMTokenObserver
+{
+    NSString *endpoint = self.config.endpointURL;
+    if (endpoint.length == 0) return;
+
+    // Обновляем сохранённый URL (может измениться между запусками)
+    s_fcmEndpointURL = [endpoint copy];
+
+    if (s_fcmTokenObserver) return; // уже зарегистрирован
+
+    s_fcmTokenObserver = [[NSNotificationCenter defaultCenter]
+        addObserverForName:PLFCMTokenDidUpdateNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *note) {
+            NSString *ep = s_fcmEndpointURL;
+            if (!ep.length) return;
+            NSLog(@"[PreloadVC] FCM token update — sending firebase fields to server");
+            PL_sendFirebaseFields(ep);
+        }];
 }
 
 
@@ -405,14 +498,19 @@
     body[@"platform"]    = @"ios";
     body[@"idfa"]        = [self pl_idfaString];
 
+    // af_id — AppsFlyer Device ID (обязателен во всех запросах)
+    NSString *afId = [PLServicesWrapper appsFlyerDeviceId];
+    if (afId.length) body[@"af_id"] = afId;
+
     // Данные атрибуции AppsFlyerr
     // Передаём данные конверсии AppsFlyer без изменений, если они есть.
     // Приоритет: сначала сохранённые в PLServicesWrapper (persisted), затем текущие attribution.
     NSDictionary *storedAF = [PLServicesWrapper storedAppsFlyerConversionData];
-    if (storedAF && [storedAF isKindOfClass:[NSDictionary class]] && storedAF.count) {
-        body[@"appsflyer"] = storedAF;
-    } else if (attribution && [attribution isKindOfClass:[NSDictionary class]] && attribution.count) {
-        body[@"appsflyer"] = attribution;
+    NSDictionary *afData = (storedAF && [storedAF isKindOfClass:[NSDictionary class]] && storedAF.count)
+        ? storedAF
+        : ((attribution && [attribution isKindOfClass:[NSDictionary class]] && attribution.count) ? attribution : nil);
+    if (afData) {
+        [body addEntriesFromDictionary:afData];
     }
 
     // Дополнительные обязательные поля

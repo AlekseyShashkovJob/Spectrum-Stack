@@ -30,9 +30,6 @@ typedef void (^PreloadOpenURLBlock)(NSURL *url);
 /// Базовый URL эндпоинта без завершающего слэша, например @"https://example.com".
 @property (nonatomic, copy) NSString *endpointURL;
 
-/// GCM Sender ID (project number) из Firebase Console.
-@property (nonatomic, copy) NSString *firebaseGCMSenderId;
-
 /// Таймаут ожидания данных атрибуции AppsFlyerr (секунды). По умолчанию 15.
 @property (nonatomic, assign) NSTimeInterval appsflyerTimeout;
 
@@ -41,8 +38,7 @@ typedef void (^PreloadOpenURLBlock)(NSURL *url);
 
 + (instancetype)configWithAppsDevKey:(NSString *)devKey
                           appleAppId:(NSString *)appleId
-                         endpointURL:(NSString *)endpoint
-                  firebaseGCMSenderId:(NSString *)gcmSenderId;
+                         endpointURL:(NSString *)endpoint;
 
 @end
 

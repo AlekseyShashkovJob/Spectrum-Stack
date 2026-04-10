@@ -17,8 +17,5 @@
 // Эндпоинт запроса: EL_ENDPOINT_URL + "/api/init"
 #define EL_ENDPOINT_URL             @"https://citysiteconnect.com"
 
-// GCM Sender ID (Project Number) из Firebase Console → Project Settings
-#define EL_FIREBASE_GCM_SENDER_ID   @"YOUR_GCM_SENDER_ID"
-
 // Заголовок на экране загрузки (название вашего приложения)
 #define EL_LOADING_TITLE            @"Loading"

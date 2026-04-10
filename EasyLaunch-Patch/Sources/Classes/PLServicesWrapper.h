@@ -51,6 +51,13 @@ typedef void (^PLAttributionBlock)(NSDictionary * _Nullable attribution, NSError
 /// Возвращает FCM token (push token) если он известен, иначе nil.
 + (nullable NSString *)firebasePushToken;
 
+/// Возвращает уникальный device ID AppsFlyer (af_id / getAppsFlyerUID).
++ (nullable NSString *)appsFlyerDeviceId;
+
+/// NSNotification, публикуемое при получении или обновлении FCM-токена.
+/// userInfo[@"token"] содержит новый токен (NSString).
+FOUNDATION_EXPORT NSNotificationName const PLFCMTokenDidUpdateNotification;
+
 // Handle incoming URLs / universal links forwarded from AppDelegate.
 + (void)handleOpenURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> * _Nullable)options;
 

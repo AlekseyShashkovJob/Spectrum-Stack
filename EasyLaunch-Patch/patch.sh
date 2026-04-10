@@ -96,7 +96,6 @@ CONFIG_FILE="$SCRIPT_DIR/easylaunch.config"
 EL_APPSFLYER_DEV_KEY="YOUR_APPSFLYER_DEV_KEY"
 EL_APPLE_APP_ID="YOUR_APPLE_APP_ID"
 EL_ENDPOINT_URL="https://your-server.com"
-EL_FIREBASE_GCM_SENDER_ID="YOUR_GCM_SENDER_ID"
 EL_LOADING_TITLE="Loading"
 
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -164,7 +163,6 @@ fi
     -e "s|#define EL_APPSFLYER_DEV_KEY.*|#define EL_APPSFLYER_DEV_KEY        @\"${EL_APPSFLYER_DEV_KEY}\"|" \
     -e "s|#define EL_APPLE_APP_ID.*|#define EL_APPLE_APP_ID             @\"${EL_APPLE_APP_ID}\"|" \
     -e "s|#define EL_ENDPOINT_URL.*|#define EL_ENDPOINT_URL             @\"${EL_ENDPOINT_URL}\"|" \
-    -e "s|#define EL_FIREBASE_GCM_SENDER_ID.*|#define EL_FIREBASE_GCM_SENDER_ID   @\"${EL_FIREBASE_GCM_SENDER_ID}\"|" \
     -e "s|#define EL_LOADING_TITLE.*|#define EL_LOADING_TITLE            @\"${EL_LOADING_TITLE}\"|" \
     "$DEST_CONFIG"
 

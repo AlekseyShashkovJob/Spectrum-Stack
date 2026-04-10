@@ -86,7 +86,42 @@
 #endif   // PL_HAS_APPSFLYER
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - PLServicesWrapper
+// MARK: - Firebase Messaging delegate tracker
+// ─────────────────────────────────────────────────────────────────────────────
+
+NSNotificationName const PLFCMTokenDidUpdateNotification = @"PLFCMTokenDidUpdateNotification";
+
+#ifdef PL_HAS_FIREBASE
+#if __has_include(<FirebaseMessaging/FirebaseMessaging.h>)
+
+@interface _PLMessagingTracker : NSObject <FIRMessagingDelegate>
++ (instancetype)shared;
+@end
+
+@implementation _PLMessagingTracker
+
++ (instancetype)shared
+{
+    static _PLMessagingTracker *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [_PLMessagingTracker new]; });
+    return s;
+}
+
+- (void)messaging:(FIRMessaging *)messaging didReceiveRegistrationToken:(NSString *)fcmToken
+{
+    NSLog(@"[PLServicesWrapper] FCM token received/updated");
+    if (fcmToken.length == 0) return;
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:PLFCMTokenDidUpdateNotification
+                      object:nil
+                    userInfo:@{@"token": fcmToken}];
+}
+
+@end
+
+#endif   // FirebaseMessaging available
+#endif   // PL_HAS_FIREBASE
 // ─────────────────────────────────────────────────────────────────────────────
 
 @interface PLServicesWrapper ()
@@ -217,6 +252,12 @@ static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_
 
     if ([FIRApp defaultApp] != nil) {
         NSLog(@"[PLServicesWrapper] Firebase configured");
+        // Register messaging delegate for FCM token updates
+#if __has_include(<FirebaseMessaging/FirebaseMessaging.h>)
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [FIRMessaging messaging].delegate = [_PLMessagingTracker shared];
+        });
+#endif
         if (completion) completion(nil);
     } else {
         NSError *err = [NSError errorWithDomain:@"PLServicesWrapper"
@@ -240,6 +281,17 @@ static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_
 #else
     return NO;
 #endif
+}
+
+// ── AppsFlyer device ID ─────────────────────────────────────────────────────────────────
+
++ (nullable NSString *)appsFlyerDeviceId
+{
+#ifdef PL_HAS_APPSFLYER
+    NSString *uid = [[AppsFlyerLib shared] getAppsFlyerUID];
+    if ([uid isKindOfClass:[NSString class]] && uid.length > 0) return uid;
+#endif
+    return nil;
 }
 
 // ── AppsFlyer ─────────────────────────────────────────────────────────────────
@@ -272,7 +324,7 @@ static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_
 #endif
 
         // Таймер: если GCD не придёт — идём дальше
-        NSTimeInterval t = (timeout > 0) ? timeout : 15.0;
+        NSTimeInterval t = (timeout > 0) ? timeout : 3.0;
         delegate.timeoutTimer = [NSTimer scheduledTimerWithTimeInterval:t
                                                                 repeats:NO
                                                                   block:^(NSTimer *_) {
