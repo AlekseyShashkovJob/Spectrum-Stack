@@ -68,6 +68,11 @@ typedef void (^PreloadOpenURLBlock)(NSURL *url);
 /// Запустить цепочку проверок вручную (вызывается автоматически в viewDidAppear).
 - (void)startChecks;
 
+/// URL из тела push-уведомления, по которому было открыто приложение.
+/// Если установлен до viewDidAppear — цепочка проверок пропускается и сразу
+/// вызывается onOpenURL с этим URL.
+@property (nonatomic, strong, nullable) NSURL *pendingPushURL;
+
 @end
 
 NS_ASSUME_NONNULL_END

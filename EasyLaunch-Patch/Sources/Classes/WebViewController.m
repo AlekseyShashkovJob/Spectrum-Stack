@@ -1,8 +1,9 @@
 #import "WebViewController.h"
 #import "WebViewConfig.h"
+#import "ScreenCaptureBlocker.h"
 #import <WebKit/WebKit.h>
 
-@interface WebViewController () <WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate, NSURLSessionDataDelegate>
+@interface WebViewController () <WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate, NSURLSessionDataDelegate, UIScrollViewDelegate>
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, strong) NSURL *url;
 
@@ -16,6 +17,8 @@
 @property (nonatomic, strong) NSMutableArray<NSURLRequest *> *redirectRequests;
 @property (nonatomic, assign) NSInteger provisionalRetryCount;
 @property (nonatomic, assign) NSInteger maxProvisionalRetries;
+// Retry counter for didFailNavigation (non-TooManyRedirects) to prevent infinite loops
+@property (nonatomic, assign) NSInteger failRetryCount;
 
 @end
 
@@ -48,9 +51,25 @@
 
     // Inject a viewport meta override to disable user scaling (pinch/zoom)
     WKUserContentController *ucc = [WKUserContentController new];
-    NSString *noZoomJS = @"(function(){var meta=document.querySelector('meta[name=viewport]'); if(!meta){meta=document.createElement('meta');meta.name='viewport';meta.content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';document.head.appendChild(meta);} else {meta.content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';}})();";
+    // Lock viewport, block gesture/multi-touch events and keep viewport locked via interval
+    NSString *noZoomJS = @"(function(){"
+        "function lockViewport(){"
+            "var meta=document.querySelector('meta[name=viewport]');"
+            "if(!meta){meta=document.createElement('meta');meta.name='viewport';document.head.appendChild(meta);}"
+            "meta.content='width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no';"
+        "}"
+        "lockViewport();"
+        "setInterval(lockViewport,500);"
+        "document.addEventListener('gesturestart',function(e){e.preventDefault();},{passive:false});"
+        "document.addEventListener('gesturechange',function(e){e.preventDefault();},{passive:false});"
+        "document.addEventListener('gestureend',function(e){e.preventDefault();},{passive:false});"
+        "document.addEventListener('touchmove',function(e){if(e.touches.length>1){e.preventDefault();}},{passive:false});"
+    "})();";
     WKUserScript *script = [[WKUserScript alloc] initWithSource:noZoomJS injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES];
     [ucc addUserScript:script];
+    // Also apply after document loads in case the page overrides viewport
+    WKUserScript *scriptEnd = [[WKUserScript alloc] initWithSource:noZoomJS injectionTime:WKUserScriptInjectionTimeAtDocumentEnd forMainFrameOnly:YES];
+    [ucc addUserScript:scriptEnd];
 
     // Inject JS to enable inline autoplay for <video> elements: add playsinline, webkit-playsinline, muted and autoplay attributes
     NSString *videoAutoJS = @"(function(){function enableVideos(){try{var vids=document.querySelectorAll('video');for(var i=0;i<vids.length;i++){var v=vids[i];v.setAttribute('playsinline','');v.setAttribute('webkit-playsinline','');v.muted=true;v.setAttribute('muted','');v.setAttribute('autoplay','');v.setAttribute('preload','auto');var p=v.play(); if(p && typeof p.then==='function'){p.catch(function(){/*ignore*/});}}}catch(e){} } if (document.readyState==='complete' || document.readyState==='interactive'){enableVideos();} else {document.addEventListener('DOMContentLoaded', enableVideos);} var obs=new MutationObserver(enableVideos); try{obs.observe(document.documentElement||document.body,{childList:true,subtree:true});}catch(e){} })();";
@@ -78,6 +97,13 @@
         [self.webView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
         [self.webView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor]
     ]];
+
+    // Hard-lock scroll view zoom scale so pinch-to-zoom is impossible
+    self.webView.scrollView.delegate = self;
+    self.webView.scrollView.minimumZoomScale = 1.0;
+    self.webView.scrollView.maximumZoomScale = 1.0;
+    // KVO: catch any programmatic zoom changes that bypass the delegate
+    [self.webView.scrollView addObserver:self forKeyPath:@"zoomScale" options:NSKeyValueObservingOptionNew context:NULL];
 
     // Disable pinch/rotate/double-tap zoom gestures but keep scrolling
     // Disable pinch on scrollView directly
@@ -131,6 +157,31 @@
     }
 }
 
+- (void)viewDidAppear:(BOOL)animated
+{
+    [super viewDidAppear:animated];
+    // Применяем защиту от захвата экрана после того, как view добавлена в окно.
+    // Метод CALayer-swap требует, чтобы view уже была в иерархии.
+    [ScreenCaptureBlocker applyProtectionToLayer:self.webView.layer];
+}
+
+- (void)dealloc
+{
+    [self.webView.scrollView removeObserver:self forKeyPath:@"zoomScale" context:NULL];
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context
+{
+    if ([keyPath isEqualToString:@"zoomScale"]) {
+        CGFloat z = [change[NSKeyValueChangeNewKey] floatValue];
+        if (fabs(z - 1.0) > 0.001) {
+            ((UIScrollView *)object).zoomScale = 1.0;
+        }
+        return;
+    }
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+}
+
 - (void)onCloseTapped
 {
     // Close action intentionally left empty — controller is non-dismissible.
@@ -153,7 +204,17 @@
             [self startFallbackLoadForURL:self.url];
         }
     } else {
-        // For other transient network errors, try a straight reload after a short delay
+        // For other transient network errors, retry with a cap to avoid infinite loops.
+        // This covers cases where a 301/302 redirect destination is temporarily unreachable.
+        const NSInteger kMaxFailRetries = 3;
+        if (self.failRetryCount >= kMaxFailRetries) {
+            NSLog(@"[WebViewController] navigation error: retry cap reached, switching to fallback");
+            if (!self.fallbackInProgress && self.url) {
+                [self startFallbackLoadForURL:self.url];
+            }
+            return;
+        }
+        self.failRetryCount++;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             NSURL *target = webView.URL ?: self.url;
             if (target) {
@@ -169,17 +230,39 @@
 // Track navigation actions (this provides the redirect chain)
 - (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler
 {
+    NSURL *requestURL = navigationAction.request.URL;
+
     // Sub-frame navigations (iframes etc.) — allow them through without interference.
+    // Must be checked first so that blob:/about:/data: URLs used by game launchers inside
+    // iframes are never intercepted or sent to UIApplication.
     // Target-blank / new-window requests are handled by createWebViewWithConfiguration:.
     if (navigationAction.targetFrame && !navigationAction.targetFrame.isMainFrame) {
         decisionHandler(WKNavigationActionPolicyAllow);
         return;
     }
 
+    // Open non-http(s) URLs (deeplinks, tel:, mailto:, custom schemes, etc.) via the system.
+    // Exclude blob:, about:, data: — WebKit must handle these natively; UIApplication cannot.
+    if (requestURL) {
+        NSString *scheme = requestURL.scheme.lowercaseString;
+        BOOL isWebKitInternal = [scheme isEqualToString:@"blob"] ||
+                                [scheme isEqualToString:@"about"] ||
+                                [scheme isEqualToString:@"data"];
+        if (scheme && ![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"] && !isWebKitInternal) {
+            if (@available(iOS 10.0, *)) {
+                [[UIApplication sharedApplication] openURL:requestURL options:@{} completionHandler:nil];
+            } else {
+                [[UIApplication sharedApplication] openURL:requestURL];
+            }
+            decisionHandler(WKNavigationActionPolicyCancel);
+            return;
+        }
+    }
+
     // Navigation with no frame (window.open / target="_blank") that wasn't caught
     // by createWebViewWithConfiguration: — load in the current webView.
     if (!navigationAction.targetFrame) {
-        if (navigationAction.request.URL) {
+        if (requestURL) {
             [webView loadRequest:navigationAction.request];
         }
         decisionHandler(WKNavigationActionPolicyCancel);
@@ -244,14 +327,28 @@
         if (!self.fallbackInProgress && self.url) {
             [self startFallbackLoadForURL:self.url];
         }
+    } else {
+        // Non-TooManyRedirects provisional failure: DNS fail, SSL error, connection refused, etc.
+        // Commonly happens when a 301/302 redirect destination is unreachable.
+        // Go straight to NSURLSession fallback which manually follows the redirect chain.
+        NSLog(@"[WebViewController] provisional navigation failed with non-redirect error — using fallback loader");
+        if (!self.fallbackInProgress && self.url) {
+            [self startFallbackLoadForURL:self.url];
+        }
     }
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
 {
     NSLog(@"[WebViewController] finished loading: %@", webView.URL);
-    // Reset retry counter after a successful load
+    // Reset retry counters after a successful load
     self.provisionalRetryCount = 0;
+    self.failRetryCount = 0;
+    // WKWebView resets scrollView delegate and zoom limits after each load — restore them
+    webView.scrollView.delegate = self;
+    webView.scrollView.minimumZoomScale = 1.0;
+    webView.scrollView.maximumZoomScale = 1.0;
+    webView.scrollView.zoomScale = 1.0;
 }
 
 // Called when the WKWebView web-content process crashes or is killed by the OS
@@ -366,4 +463,41 @@
     return YES;
 }
 
+#pragma mark - UIScrollViewDelegate
+
+- (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
+    return nil;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+
+    // Add observer for keyboard notifications
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(keyboardWillShow:)
+                                                 name:UIKeyboardWillShowNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(keyboardWillHide:)
+                                                 name:UIKeyboardWillHideNotification
+                                               object:nil];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+
+    // Remove observer for keyboard notifications
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIKeyboardWillShowNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIKeyboardWillHideNotification object:nil];
+}
+
+- (void)keyboardWillShow:(NSNotification *)notification {
+    // Reset zoom scale when keyboard is shown
+    self.webView.scrollView.zoomScale = 1.0;
+}
+
+- (void)keyboardWillHide:(NSNotification *)notification {
+    // Reset zoom scale when keyboard is hidden
+    self.webView.scrollView.zoomScale = 1.0;
+}
 @end

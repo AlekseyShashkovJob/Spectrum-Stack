@@ -110,8 +110,14 @@ NSNotificationName const PLFCMTokenDidUpdateNotification = @"PLFCMTokenDidUpdate
 
 - (void)messaging:(FIRMessaging *)messaging didReceiveRegistrationToken:(NSString *)fcmToken
 {
-    NSLog(@"[PLServicesWrapper] FCM token received/updated");
-    if (fcmToken.length == 0) return;
+    if (fcmToken.length == 0) {
+        NSLog(@"[PLServicesWrapper] FCM token callback fired but token is empty");
+        return;
+    }
+    NSLog(@"[PLServicesWrapper] FCM token received/updated: %.10s…", fcmToken.UTF8String);
+    // Persist so firebasePushToken can return it synchronously on subsequent calls
+    [[NSUserDefaults standardUserDefaults] setObject:fcmToken forKey:@"PLFCMToken"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
     [[NSNotificationCenter defaultCenter]
         postNotificationName:PLFCMTokenDidUpdateNotification
                       object:nil
@@ -186,6 +192,10 @@ static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_
 {
 #ifdef PL_HAS_FIREBASE
 #if __has_include(<FirebaseMessaging/FirebaseMessaging.h>)
+    // Fast path: return persisted token immediately (avoids 0.5 s semaphore on every call)
+    NSString *stored = [[NSUserDefaults standardUserDefaults] stringForKey:@"PLFCMToken"];
+    if (stored.length > 0) return stored;
+
     FIRMessaging *messaging = [FIRMessaging messaging];
     if (messaging) {
         if ([messaging respondsToSelector:@selector(tokenWithCompletion:)]) {
@@ -252,10 +262,30 @@ static NSString * const kPLAppsFlyerConversionKey = @"PLAppsFlyerConversionData_
 
     if ([FIRApp defaultApp] != nil) {
         NSLog(@"[PLServicesWrapper] Firebase configured");
-        // Register messaging delegate for FCM token updates
 #if __has_include(<FirebaseMessaging/FirebaseMessaging.h>)
         dispatch_async(dispatch_get_main_queue(), ^{
             [FIRMessaging messaging].delegate = [_PLMessagingTracker shared];
+
+            // Unity's UnityAppController is the real AppDelegate.
+            // Firebase swizzling does NOT intercept didRegisterForRemoteNotificationsWithDeviceToken
+            // reliably in Unity — Unity posts kUnityDidRegisterForRemoteNotificationsWithDeviceToken
+            // instead. We must forward the APNs device token to Firebase manually.
+            extern NSString* const kUnityDidRegisterForRemoteNotificationsWithDeviceToken;
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:kUnityDidRegisterForRemoteNotificationsWithDeviceToken
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                NSData *deviceToken = note.userInfo[@"deviceToken"];
+                if ([deviceToken isKindOfClass:[NSData class]] && deviceToken.length > 0) {
+                    NSLog(@"[PLServicesWrapper] Forwarding APNs token to Firebase Messaging");
+                    [FIRMessaging messaging].APNSToken = deviceToken;
+                }
+            }];
+
+            // Trigger APNs registration — Unity will receive the token via the AppDelegate
+            // and post kUnityDidRegisterForRemoteNotificationsWithDeviceToken.
+            [[UIApplication sharedApplication] registerForRemoteNotifications];
         });
 #endif
         if (completion) completion(nil);

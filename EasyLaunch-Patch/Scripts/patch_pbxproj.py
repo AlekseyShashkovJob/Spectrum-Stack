@@ -37,6 +37,8 @@ DEFAULT_PATCH_FILES = [
     "WebViewConfig.m",
     "NotificationPromptViewController.h",
     "NotificationPromptViewController.m",
+    "ScreenCaptureBlocker.h",
+    "ScreenCaptureBlocker.m",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────

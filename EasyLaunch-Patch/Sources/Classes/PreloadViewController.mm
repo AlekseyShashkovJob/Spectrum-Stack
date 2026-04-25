@@ -27,6 +27,8 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
     NSString *afId = [PLServicesWrapper appsFlyerDeviceId];
     if (afId.length)  body[@"af_id"] = afId;
 
+    body[@"locale"] = [NSLocale preferredLanguages].firstObject ?: @"en";
+
     NSString *firebaseProject = [PLServicesWrapper firebaseProjectId];
     if (firebaseProject.length) body[@"firebase_project_id"] = firebaseProject;
     body[@"push_token"] = pushToken;
@@ -106,6 +108,10 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 @property (atomic, assign) BOOL notificationPromptShownThisSession;
 // Prevent repeated endpoint refresh attempts during a single preload run
 @property (atomic, assign) BOOL endpointRefreshAttempted;
+/// Используется для отображения ошибки подключения без presentViewController
+@property (nonatomic, strong) UIView *noInternetView;
+/// Полупрозрачный тёмный оверлей за экраном «Нет интернета»
+@property (nonatomic, strong) UIView *noInternetOverlay;
 
 @end
 
@@ -122,6 +128,7 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
     [super viewDidLoad];
     [self pl_setupBackground];
     [self pl_setupLogoAndSpinner];
+    [self pl_setupNoInternetView];
 }
 
 - (void)viewDidLayoutSubviews
@@ -141,28 +148,62 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 - (void)startChecks
 {
     self.attributionData = nil;
-    [_spinner startAnimating];
+    self.noInternetView.hidden = YES;
+    self.noInternetOverlay.hidden = YES;
+
+    // ── Push-путь: приложение открыто тапом по уведомлению с URL ──────────────
+    if (self.pendingPushURL) {
+        NSURL *pushURL = self.pendingPushURL;
+        self.pendingPushURL = nil; // Сбрасываем после обработки
+        NSLog(@"[PreloadVC] Using push URL: %@", pushURL);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.onOpenURL) self.onOpenURL(pushURL);
+            [self->_spinner stopAnimating];
+        });
+        return;
+    }
+
+    // Убедимся, что цепочка запуска не выполняется при наличии URL из пуша
+    NSLog(@"[PreloadVC] No pending push URL, proceeding with config chain");
 
     // ── Быстрый путь: режим запуска уже определён при предыдущем запуске ──
     NSString *savedMode = [[NSUserDefaults standardUserDefaults] stringForKey:@"PLLaunchMode"];
 
     if ([savedMode isEqualToString:@"unity"]) {
-        NSLog(@"[PreloadVC] Saved launch mode: Unity — launching directly");
-        dispatch_async(dispatch_get_main_queue(), ^{
+        NSLog(@"[PreloadVC] Saved launch mode: Unity — waiting briefly for pending push before launch");
+        // Задержка 0.5с даёт iOS время доставить didReceiveNotificationResponse
+        // до того как мы зафиксируем запуск Unity.
+        // На старте через push didReceiveNotificationResponse приходит чуть позже viewDidAppear,
+        // и без задержки unity fast path успевает вызвать onComplete раньше.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self.pendingPushURL) {
+                // Push пришёл пока ждали — открываем WebView вместо Unity
+                NSURL *pushURL = self.pendingPushURL;
+                self.pendingPushURL = nil;
+                NSLog(@"[PreloadVC] Push URL intercepted before Unity launch — switching to WebView: %@", pushURL);
+                [[NSUserDefaults standardUserDefaults] setObject:@"webview" forKey:@"PLLaunchMode"];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+                [self pl_checkAndAskNotificationsIfNeededWithCompletion:^{
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self->_spinner stopAnimating];
+                        if (self.onOpenURL) self.onOpenURL(pushURL);
+                    });
+                }];
+                return;
+            }
             [self->_spinner stopAnimating];
             if (self.onComplete) self.onComplete();
         });
         return;
     }
-
     // webview или первый запуск — всегда пробуем получить свежий URL через полную цепочку.
     // Сохранённый URL используется только как fallback внутри цепочки при ошибках.
     if (savedMode) {
         NSLog(@"[PreloadVC] Saved launch mode: %@ — running full chain to get fresh URL", savedMode);
     }
 
-    // Полная цепочка
-    [self pl_updateStatus:@"Starting…" detail:nil progress:0.0];
+    // Полная цепочка    
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         [self pl_step1_checkNetwork];
     });
@@ -227,6 +268,80 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
     ]];
 }
 
+- (void)pl_setupNoInternetView
+{
+    // Полупрозрачный тёмный фон
+    UIView *overlay = [[UIView alloc] init];
+    overlay.translatesAutoresizingMaskIntoConstraints = NO;
+    overlay.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
+    overlay.hidden = YES;
+    [self.view addSubview:overlay];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [overlay.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [overlay.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [overlay.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [overlay.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+    ]];
+
+    UIView *container = [[UIView alloc] init];
+    container.translatesAutoresizingMaskIntoConstraints = NO;
+    container.hidden = YES;
+    [self.view addSubview:container];
+
+    UIImageView *iconView = [[UIImageView alloc] init];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
+            configurationWithPointSize:52 weight:UIImageSymbolWeightLight];
+        iconView.image = [UIImage systemImageNamed:@"wifi.slash" withConfiguration:cfg];
+    }
+    iconView.tintColor = [UIColor colorWithWhite:0.85 alpha:1.0];
+    iconView.contentMode = UIViewContentModeScaleAspectFit;
+    iconView.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:iconView];
+
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.text = @"No Internet Connection";
+    titleLabel.textColor = [UIColor whiteColor];
+    titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    titleLabel.textAlignment = NSTextAlignmentCenter;
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:titleLabel];
+
+    UILabel *messageLabel = [[UILabel alloc] init];
+    messageLabel.text = @"Please check your network settings\nand try again.";
+    messageLabel.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
+    messageLabel.font = [UIFont systemFontOfSize:15];
+    messageLabel.textAlignment = NSTextAlignmentCenter;
+    messageLabel.numberOfLines = 0;
+    messageLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:messageLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [container.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [container.centerYAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.centerYAnchor],
+        [container.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.view.leadingAnchor constant:40],
+        [container.trailingAnchor constraintLessThanOrEqualToAnchor:self.view.trailingAnchor constant:-40],
+
+        [iconView.topAnchor constraintEqualToAnchor:container.topAnchor],
+        [iconView.centerXAnchor constraintEqualToAnchor:container.centerXAnchor],
+        [iconView.widthAnchor constraintEqualToConstant:56],
+        [iconView.heightAnchor constraintEqualToConstant:56],
+
+        [titleLabel.topAnchor constraintEqualToAnchor:iconView.bottomAnchor constant:16],
+        [titleLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [titleLabel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+
+        [messageLabel.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:10],
+        [messageLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [messageLabel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [messageLabel.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
+    ]];
+
+    self.noInternetOverlay = overlay;
+    self.noInternetView = container;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Этапы загрузки
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,9 +358,6 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 
 - (void)pl_step1_checkNetwork
 {
-    [self pl_updateStatus:@"Checking connection…"
-                   detail:@"Network"
-                 progress:0.05];
 
     NSString *pingTarget = self.config.endpointURL ?: @"https://apple.com";
     NSURL *pingURL = [NSURL URLWithString:pingTarget];
@@ -260,8 +372,7 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
 
-        if (e == nil) {
-            [strongSelf pl_updateStatus:@"Connection OK" detail:nil progress:0.15];
+        if (e == nil) {            
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 [strongSelf pl_step2_initFirebase];
             });
@@ -285,8 +396,7 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
                 __strong typeof(weakSelf) strongSelf2 = weakSelf;
                 if (!strongSelf2) return;
                 if (e2 == nil) {
-                    NSLog(@"[PreloadVC] Fallback network check OK (apple.com)");
-                    [strongSelf2 pl_updateStatus:@"Connection OK" detail:@"Endpoint unreachable" progress:0.15];
+                    NSLog(@"[PreloadVC] Fallback network check OK (apple.com)");                    
                     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                         [strongSelf2 pl_step2_initFirebase];
                     });
@@ -305,16 +415,10 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 
 - (void)pl_step2_initFirebase
 {
-    [self pl_updateStatus:@"Initializing Firebase…"
-                   detail:@"Firebase"
-                 progress:0.20];
     // Инициализируем Firebase напрямую — уведомления спрашиваем позже, только при WebView
     [PLServicesWrapper configureFirebase:^(NSError *fbError) {
         if (fbError) {
-            NSLog(@"[PreloadVC] Firebase warning (non-fatal): %@", fbError.localizedDescription);
-            [self pl_updateStatus:@"Firebase unavailable" detail:fbError.localizedDescription progress:0.40];
-        } else {
-            [self pl_updateStatus:@"Firebase ready" detail:nil progress:0.40];
+            NSLog(@"[PreloadVC] Firebase warning (non-fatal): %@", fbError.localizedDescription);            
         }
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             [self pl_step3_initAppsFlyer];
@@ -370,18 +474,16 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
     if (@available(iOS 10.0, *)) {
         UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
         [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings * _Nonnull settings) {
+            UNAuthorizationStatus currentStatus = settings.authorizationStatus;
             BOOL shouldRequest = NO;
-            if (settings.authorizationStatus == UNAuthorizationStatusNotDetermined) {
-                shouldRequest = YES;
-            } else if (settings.authorizationStatus == UNAuthorizationStatusDenied) {
+            if (currentStatus == UNAuthorizationStatusNotDetermined ||
+                currentStatus == UNAuthorizationStatusDenied) {
                 NSDate *lastDenied = [[NSUserDefaults standardUserDefaults] objectForKey:@"PLLastNotificationDeniedAt"];
                 if (!lastDenied) {
                     shouldRequest = YES;
                 } else {
                     NSTimeInterval since = [[NSDate date] timeIntervalSinceDate:lastDenied];
-                    if (since >= (3 * 24 * 60 * 60)) {
-                        shouldRequest = YES; // прошло 3 дня
-                    }
+                    shouldRequest = (since >= (3 * 24 * 60 * 60)); // 3 дня
                 }
             }
 
@@ -410,21 +512,39 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
                         strongSelf.notificationPromptShownThisSession = YES;
                         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"PLAskedForNotifications"];
                         [[NSUserDefaults standardUserDefaults] synchronize];
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            UNAuthorizationOptions opts = (UNAuthorizationOptionBadge | UNAuthorizationOptionSound | UNAuthorizationOptionAlert);
-                            [center requestAuthorizationWithOptions:opts completionHandler:^(BOOL granted, NSError * _Nullable err) {
-                                if (!granted) {
-                                    [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:@"PLLastNotificationDeniedAt"];
-                                } else {
-                                    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"PLLastNotificationDeniedAt"];
-                                }
-                                [[NSUserDefaults standardUserDefaults] synchronize];
-                                dispatch_async(dispatch_get_main_queue(), ^{
-                                    strongSelf.isPresentingNotificationPrompt = NO;
+                        if (currentStatus == UNAuthorizationStatusDenied) {
+                            // Системное разрешение отозвано — iOS не покажет диалог повторно.
+                            // Открываем настройки приложения, чтобы пользователь мог включить их вручную.
+                            [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"PLLastNotificationDeniedAt"];
+                            [[NSUserDefaults standardUserDefaults] synchronize];
+                            strongSelf.isPresentingNotificationPrompt = NO;
+                            NSURL *settingsURL = [NSURL URLWithString:UIApplicationOpenSettingsURLString];
+                            if (settingsURL && [[UIApplication sharedApplication] canOpenURL:settingsURL]) {
+                                [[UIApplication sharedApplication] openURL:settingsURL
+                                                                   options:@{}
+                                                         completionHandler:^(BOOL success) {
                                     completion();
-                                });
-                            }];
-                        });
+                                }];
+                            } else {
+                                completion();
+                            }
+                        } else {
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                                UNAuthorizationOptions opts = (UNAuthorizationOptionBadge | UNAuthorizationOptionSound | UNAuthorizationOptionAlert);
+                                [center requestAuthorizationWithOptions:opts completionHandler:^(BOOL granted, NSError * _Nullable err) {
+                                    if (!granted) {
+                                        [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:@"PLLastNotificationDeniedAt"];
+                                    } else {
+                                        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"PLLastNotificationDeniedAt"];
+                                    }
+                                    [[NSUserDefaults standardUserDefaults] synchronize];
+                                    dispatch_async(dispatch_get_main_queue(), ^{
+                                        strongSelf.isPresentingNotificationPrompt = NO;
+                                        completion();
+                                    });
+                                }];
+                            });
+                        }
                     }
                     cancelHandler:^{
                         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -450,10 +570,6 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 
 - (void)pl_step3_initAppsFlyer
 {
-    [self pl_updateStatus:@"Initializing AppsFlyer…"
-                   detail:@"AppsFlyer"
-                 progress:0.45];
-
     NSString *devKey   = self.config.appsDevKey ?: @"";
     NSString *appleId  = self.config.appleAppId ?: @"";
     NSTimeInterval tmo = self.config ? self.config.appsflyerTimeout : 15.0;
@@ -464,8 +580,7 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
                                gcdWaitTimeout:tmo
                                      completion:^(NSDictionary *attribution, NSError *error) {
         NSLog(@"[PreloadVC] AppsFlyer attribution: %@", attribution);
-        self.attributionData = attribution;
-        [self pl_updateStatus:@"AppsFlyer ready" detail:nil progress:0.70];
+        self.attributionData = attribution;        
 
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             [self pl_step4_requestEndpoint:attribution];
@@ -484,9 +599,6 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
         return;
     }
 
-    [self pl_updateStatus:@"Verifying…"
-                   detail:@"Server check"
-                 progress:0.75];
 
     // ── Формируем тело запроса ────────────────────────────────────────────────
     NSMutableDictionary *body = [NSMutableDictionary dictionary];
@@ -501,6 +613,8 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
     // af_id — AppsFlyer Device ID (обязателен во всех запросах)
     NSString *afId = [PLServicesWrapper appsFlyerDeviceId];
     if (afId.length) body[@"af_id"] = afId;
+
+    body[@"locale"] = [NSLocale preferredLanguages].firstObject ?: @"en";
 
     // Данные атрибуции AppsFlyerr
     // Передаём данные конверсии AppsFlyer без изменений, если они есть.
@@ -518,15 +632,13 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
     // store_id берём из конфига (apple App Store id)
     body[@"store_id"] = self.config.appleAppId ?: @"";
 
-    // Firebase fields: project id и push token (если доступны)
+    // Firebase fields: project id и push token (всегда включаем, пустая строка если недоступен)
     NSString *firebaseProject = [PLServicesWrapper firebaseProjectId];
     if (firebaseProject && firebaseProject.length) {
         body[@"firebase_project_id"] = firebaseProject;
     }
     NSString *pushToken = [PLServicesWrapper firebasePushToken];
-    if (pushToken && pushToken.length) {
-        body[@"push_token"] = pushToken;
-    }
+    body[@"push_token"] = pushToken ?: @"";
 
     // ── HTTP запрос ───────────────────────────────────────────────────────────
     NSURL *url = [NSURL URLWithString:[baseURL stringByAppendingString:@"/config.php"]];
@@ -566,8 +678,7 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
         NSLog(@"[PreloadVC] Endpoint status: %ld", (long)http.statusCode);
-
-        [self pl_updateStatus:@"Processing response…" detail:nil progress:0.90];
+        
 
         // ── Разбираем ответ ───────────────────────────────────────────────────
         NSURL *redirectURL = nil;
@@ -646,11 +757,33 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 /// `url == nil`  → запускаем Unity (onComplete) — уведомления НЕ запрашиваем
 /// `url != nil`  → показываем WebView (onOpenURL) — сначала запрашиваем уведомления (если не спрашивали в эту сессию)
 - (void)pl_finishWithURL:(nullable NSURL *)url
-{
-    [self pl_updateStatus:@"Done!" detail:nil progress:1.00];
+{    
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        // ── Push-приоритет: проверяем на главном потоке после небольшой задержки. ──
+        // pl_finishWithURL: вызывается из фонового потока (URLSession completion), поэтому
+        // проверять pendingPushURL там небезопасно — didReceiveNotificationResponse: устанавливает
+        // его через dispatch_async(main_queue) и этот блок может ещё не выполниться.
+        // Проверка здесь, на main queue через 0.3с, гарантирует что пуш уже обработан.
+        if (self.pendingPushURL) {
+            NSURL *pushURL = self.pendingPushURL;
+            self.pendingPushURL = nil;
+            NSLog(@"[PreloadVC] Push URL received during chain — overriding server URL with: %@", pushURL);
+            // Сохраняем режим запуска
+            if (![[NSUserDefaults standardUserDefaults] stringForKey:@"PLLaunchMode"]) {
+                [[NSUserDefaults standardUserDefaults] setObject:@"webview" forKey:@"PLLaunchMode"];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+            }
+            [self->_spinner stopAnimating];
+            [self pl_checkAndAskNotificationsIfNeededWithCompletion:^{
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (self.onOpenURL) self.onOpenURL(pushURL);
+                });
+            }];
+            return;
+        }
+
         [self->_spinner stopAnimating];
 
         // Для WebView-пути: если config.php не вернул URL — используем последний сохранённый
@@ -698,51 +831,13 @@ static void PL_sendFirebaseFields(NSString *endpointURL)
 // MARK: - Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-- (void)pl_updateStatus:(NSString *)text
-                 detail:(nullable NSString *)detail
-               progress:(float)progress
-{
-    // Визуальные индикаторы статуса/прогресса убраны — только спиннер остаётся
-}
-
 - (void)pl_showNoInternetRetry
 {
-    // Если режим уже определён как webview и есть сохранённый URL —
-    // используем его как fallback вместо показа диалога «Нет интернета».
-    NSString *savedMode = [[NSUserDefaults standardUserDefaults] stringForKey:@"PLLaunchMode"];
-    if ([savedMode isEqualToString:@"webview"]) {
-        NSString *stored = [[NSUserDefaults standardUserDefaults] stringForKey:@"PLLastEndpointURLString"];
-        NSURL *storedURL = stored.length ? [NSURL URLWithString:stored] : nil;
-        if (storedURL) {
-            NSLog(@"[PreloadVC] No internet — using stored WebView URL as fallback: %@", storedURL);
-            [self pl_checkAndAskNotificationsIfNeededWithCompletion:^{
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self->_spinner stopAnimating];
-                    if (self.onOpenURL) {
-                        self.onOpenURL(storedURL);
-                    } else {
-                        [[UIApplication sharedApplication] openURL:storedURL options:@{} completionHandler:nil];
-                    }
-                });
-            }];
-            return;
-        }
-    }
-
+    NSLog(@"[PreloadVC] No internet — showing no connection UI");
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self pl_updateStatus:@"No connection" detail:nil progress:0.0];
-
-        UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:@"No Internet Connection"
-                                                message:@"Please check your network settings and try again."
-                                         preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:
-            [UIAlertAction actionWithTitle:@"Retry"
-                                     style:UIAlertActionStyleDefault
-                                   handler:^(UIAlertAction *a) {
-                [self startChecks];
-            }]];
-        [self presentViewController:alert animated:YES completion:nil];
+        [self->_spinner stopAnimating];
+        self.noInternetOverlay.hidden = NO;
+        self.noInternetView.hidden = NO;
     });
 }
 

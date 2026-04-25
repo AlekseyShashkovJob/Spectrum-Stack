@@ -82,6 +82,8 @@ declare -a PATCH_FILES=(
     "WebViewConfig.m"
     "NotificationPromptViewController.h"
     "NotificationPromptViewController.m"
+    "ScreenCaptureBlocker.h"
+    "ScreenCaptureBlocker.m"
 )
 
 # Дополнительные ресурсы (изображения и plist)
@@ -208,6 +210,26 @@ python3 "$SCRIPTS_DIR/add_spm_packages.py" "$PBXPROJ"
 success "project.pbxproj обновлён."
 
 # =============================================================================
+# ДОПОЛНИТЕЛЬНО 5c — Entitlements (aps-environment для push-уведомлений)
+# =============================================================================
+info "Добавление entitlements для push-уведомлений …"
+
+ENTITLEMENTS_SRC="$SCRIPT_DIR/Sources/Unity-iPhone.entitlements"
+ENTITLEMENTS_DST_DIR="$XCODE_ROOT/Unity-iPhone"
+ENTITLEMENTS_DST="$ENTITLEMENTS_DST_DIR/Unity-iPhone.entitlements"
+ENTITLEMENTS_PROJ_PATH="Unity-iPhone/Unity-iPhone.entitlements"
+
+if [[ -f "$ENTITLEMENTS_SRC" ]]; then
+    mkdir -p "$ENTITLEMENTS_DST_DIR"
+    cp "$ENTITLEMENTS_SRC" "$ENTITLEMENTS_DST"
+    echo "    ✓  Unity-iPhone.entitlements -> Unity-iPhone/"
+    python3 "$SCRIPTS_DIR/add_entitlements.py" "$PBXPROJ" "$ENTITLEMENTS_PROJ_PATH"
+    success "Entitlements добавлены."
+else
+    warn "Sources/Unity-iPhone.entitlements не найден — пропуск."
+fi
+
+# =============================================================================
 # ДОПОЛНИТЕЛЬНО — Добавление Notification Service Extension таргета
 # (после 5b, чтобы Firebase уже присутствовал в packageReferences)
 # =============================================================================
@@ -218,6 +240,22 @@ if ruby "$SCRIPTS_DIR/add_notification_extension_service.rb" "$XCODEPROJ" "$MAIN
     success "Notification Service Extension добавлен."
 else
     warn "Ошибка при добавлении Notification Service Extension. Продолжаем..."
+fi
+
+# =============================================================================
+# ДОПОЛНИТЕЛЬНО — Патч Info.plist: разрешения камеры и микрофона
+# =============================================================================
+info "Добавление разрешений камеры/микрофона в Info.plist …"
+
+INFOPLIST_PATH="$XCODE_ROOT/Info.plist"
+if [[ -f "$INFOPLIST_PATH" ]]; then
+    if python3 "$SCRIPTS_DIR/patch_infoplist.py" "$INFOPLIST_PATH"; then
+        success "Info.plist обновлён."
+    else
+        warn "Ошибка при патчинге Info.plist — продолжаем."
+    fi
+else
+    warn "Info.plist не найден по пути $INFOPLIST_PATH — пропуск."
 fi
 
 # =============================================================================
